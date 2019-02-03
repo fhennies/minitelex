@@ -1,28 +1,121 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Minitelex script v3.0
+# Minitelex script v3.1
+# Kennungsgeberabfrage, speichere jobid
+# bessere struktur
 # Socket Server als i-Telexdiensteübergang
 # Individuelle Ports
 # Faxversand IAXMODEM -> ASTERISK -> personal-voip
 
-# from creds import *
+from telex import *
 import socket
 import select
 import sys
 import requests
+import datetime
 from _thread import *
 from time import sleep
 from subprocess import call
+from tinydb import TinyDB, Query
 
 anschluesse = {}
 knng = {}
 faxe = {}
 isA4 = {}
 
+servers = []
+
 enscriptEps = '~epsf[sx1.05 sy0.95 x-4a y0a]{telexpapier.eps}'
 
 HOST = ''   # Symbolic name, meaning all available interfaces
+
+def zieheKennung(nachricht):
+	zeilen = nachricht.split('\r\n')
+	hierIst = ''
+	if len(zeilen) > 4:
+		if len(zeilen[-1]) > 5:
+			hierIst = zeilen[-1].strip('+')
+			werDa = zeilen[-2]
+		elif len(zeilen[-2]) > 5:
+			hierIst = zeilen[-2].strip('+')
+			werDa = zeilen[-3]
+		elif len(zeilen[-3]) > 5:
+			hierIst = zeilen[-3].strip('+')
+			werDa = zeilen[-4]
+		print (hierIst)
+	return hierIst
+
+def telexRand(text):
+	zeilen = text.split('\r\n')
+	mitRand = text
+	if len(zeilen) > 58:
+		n = 58
+		i = n
+		while i < len(zeilen):
+			zeilen.insert(i, enscriptEps)
+			i += (n+1)
+		mitRand = '\r\n'.join(zeilen)
+	mitRand += enscriptEps
+	return mitRand
+
+def faxen(nachricht, port, jobtag):
+	if (len(nachricht) > 40) and (isA4[port] == '0'):
+		print('wahl ist kurze seite')
+		with open('cache/%s.txt' % port, "w+") as tf:
+			tf.write(nachricht)
+		rc = call(['sendfax -n -i %s -d %s cache/%s.txt' % (jobtag, faxe[port],port)], shell=True)
+	elif (len(nachricht) > 40) and (isA4[port] == '1'):
+		print('wahl ist a4')
+		with open('cache/%s.txt' % port, "w+") as tf:
+			tf.write(nachricht)
+		rc = call(['cache/txt2pdf.sh ' + port], shell=True)
+		rc = call(['sendfax -n -i %s -d %s cache/%s.pdf' % (jobtag, faxe[port],port)], shell=True)
+	elif (len(nachricht) > 40) and (isA4[port] == '2'):
+		print('wahl ist rand')
+		nachrichtRand = telexRand(nachricht)
+		with open('cache/%s.txt' % port, "w+") as tf:
+			tf.write(nachrichtRand)
+		rc = call(['cache/telex2pdf.sh ' + port], shell=True)
+		rc = call(['sendfax -n -i %s -d %s cache/%s.pdf' % (jobtag, faxe[port],port)], shell=True)
+
+#Function for handling connections. This will be used to create threads
+def clientthread(conn):
+	port = str(conn.getsockname()[1])
+	print('Port: ' + port)
+	jetzt = datetime.datetime.now().replace(microsecond=0).isoformat(' ')
+	print('--------------------------')
+	print('Nachrichtenempfang:')
+	nachricht = jetzt + '\r\n'
+	sleep(2)
+	nachricht += empfangen(knng[port], conn)
+
+	#came out of loop
+	conn.close()
+
+	print(nachricht)
+	print('--------------------------')
+	print ('connection closed')
+
+	hierIst = zieheKennung(nachricht)
+	senderNummer = hierIst.split(' ')
+	senderExist, senderHost, senderIp, durchwahl = auskunft(senderNummer[0])
+	jobTagID = 0
+	db = TinyDB('minifaxe.json')
+	suche = Query()
+	if 'ok' in senderExist:
+		try:
+			od = sorted(db.search(suche.Minitelex == str(port)), key=lambda k: k['jobTagID'])
+			jobTagID = od[-1]['jobTagID']+1
+		except:
+			jobTagID = 1
+		db.insert({'Minitelex' : str(port), 'MiniKennung' : knng[port], 'jobTagID' : jobTagID, 'Kennung' : hierIst, \
+			'Nummer' : senderNummer[0], 'Zeit' : jetzt})
+	db.close()
+	jobtag = str(port) + '-' + str(jobTagID)
+	faxen(nachricht, port, jobtag)
+
+# ende der definitionen
 
 with open('minitelexbuch.txt', 'r') as f:
 	for line in f:
@@ -31,7 +124,6 @@ with open('minitelexbuch.txt', 'r') as f:
 		faxe[port] = fax
 		isA4[port] = iA4
 		print (port + knng[port] + faxe[port])
-servers = []
 
 for port in knng:
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -48,68 +140,7 @@ for port in knng:
 	print ('Socket now listening')
 	servers.append(s)
 
-#Function for handling connections. This will be used to create threads
-def clientthread(conn):
-	port = str(conn.getsockname()[1])
-	print('Port: ' + port)
-	print('--------------------------')
-	print('Nachrichtenempfang:')
-	nachricht = ""
-	sleep(2)
-	while True:
-		#Receiving from client
-		bytData = conn.recv(1024)
-		data = bytData.decode('utf-8')
-		print (data)
-		if not bytData:
-			break
-		if '@' in data:
-			sleep(1)
-			kennu = '\r\n' + knng[port]
-			for x in range(len(kennu)):
-				conn.send(kennu[x].encode('utf-8'))
-				sleep(0.15)
-			print (kennu)
-			nachricht += kennu
-		elif '#' in data:
-			data = ''		
-		else:
-			nachricht += data
 
-	#came out of loop
-	conn.close()
-
-	print(nachricht)
-	print('--------------------------')
-	print ('connection closed')
-
-	if (len(nachricht) > 20) and (isA4[port] == '0'):
-		print('hallo, wahl ist kurze seite')
-		with open(port + ".txt", "w+") as tf:
-			tf.write(nachricht)
-		rc = call(['sendfax -n -d %s %s.txt' % (faxe[port],port)], shell=True)
-	elif (len(nachricht) > 20) and (isA4[port] == '1'):
-		print('hallo, wahl ist a4')
-		with open(port + ".txt", "w+") as tf:
-			tf.write(nachricht)
-		rc = call(["./txt2pdf.sh " + port], shell=True)
-		rc = call(['sendfax -n -d %s %s.pdf' % (faxe[port],port)], shell=True)
-	elif (len(nachricht) > 20) and (isA4[port] == '2'):
-		print('hallo, wahl ist rand')
-		if len(nachricht.split('\r\n')) > 58:
-			zeilen = nachricht.split('\r\n')
-			n = 58
-			i = n
-			while i < len(zeilen):
-				zeilen.insert(i, enscriptEps)
-				i += (n+1)
-			nachricht = '\r\n'.join(zeilen)
-		nachricht += enscriptEps
-		with open(port + ".txt", "w+") as tf:
-			tf.write(nachricht)
-		rc = call(["./telex2pdf.sh " + port], shell=True)
-		rc = call(['sendfax -n -d %s %s.pdf' % (faxe[port],port)], shell=True)
-	
 #now keep talking with the client
 while True:
 	readable,_,_ = select.select(servers, [], [])
